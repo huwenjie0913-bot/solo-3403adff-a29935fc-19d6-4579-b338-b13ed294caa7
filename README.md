@@ -27,6 +27,12 @@ python -m pytest tests/ -q    # 测试
 | POST | `/api/v1/plans/{id}/replay` | 用存储的请求与算法版本重演，核对指标 |
 | POST | `/api/v1/plans/{id}/replan` | 冻结部分测线，按覆盖参数重排剩余区域 |
 | GET | `/api/v1/plans/{a}/compare/{b}` | 两版本对照：覆盖率/航程/能耗/风险差值 |
+| POST | `/api/v1/plans/{id}/flights` | 提交实飞日志，按方案核验（201） |
+| GET | `/api/v1/plans/{id}/flights` | 列出该方案的全部实飞核验 |
+| GET | `/api/v1/flights/{fid}` | 取回某次核验结果 |
+| GET | `/api/v1/flights/{fid}/geojson` | GeoJSON 核验报告（轨迹/照片/漏拍面/事件点） |
+| POST | `/api/v1/flights/{fid}/replay` | 用存储的日志与规则版本重演，核对指标 |
+| POST | `/api/v1/flights/{fid}/reflight` | 锁定合格测段，对剩余区域生成补飞方案 |
 
 ### 规划请求
 
@@ -86,6 +92,66 @@ POST /api/v1/plans/{id}/replan
 冻结段原样保留（`frozen: true`），其已覆盖范围从测区中扣除后按新参数重
 排；结果存为子方案（`parent_id`），可与父方案 `compare`。
 
+## 实飞核验
+
+飞完一架次后，把飞控日志与相机触发记录提交给原方案即可核验：
+
+```json
+POST /api/v1/plans/{id}/flights
+{
+  "crs": "EPSG:4326",
+  "track": [
+    {"t": "2026-09-14T09:00:00Z", "pos": [116.0, 40.0],
+     "alt_m": 210.5, "battery_wh": 248.0}
+  ],
+  "photos": [
+    {"id": "IMG_0001", "t": "2026-09-14T09:00:12Z", "pos": [116.0, 40.0],
+     "alt_m": 210.1,
+     "attitude": {"roll_deg": 0.8, "pitch_deg": -1.1, "yaw_deg": 90.0}}
+  ],
+  "options": {"deviation_threshold_m": 15.0, "gsd_tolerance": 0.15,
+              "min_forward_overlap": null, "max_tilt_deg": 5.0,
+              "gap_area_threshold_m2": 1.0}
+}
+```
+
+- `crs` 可省略（默认取方案的坐标系）；轨迹与照片的坐标按各自 CRS 自动
+  转到方案的度量坐标系计算，投影坐标系同样要求米制单位。
+- `track[].t` 支持 ISO 8601 或 Unix 秒；`alt_m` 为海拔（米，AMSL）；
+  `battery_wh` 为剩余电量（Wh）。
+- **校验**（全部错误以 400 列表返回）：CRS 可解析且量纲为米/度；轨迹时
+  间严格递增、照片时间不逆序且不超出轨迹时段（±300 s）；`alt_m` 在
+  −500..9000 m、`battery_wh` 在 0..方案电量×1.2 内且单调不增（容忍
+  0.5 Wh BMS 噪声）；相邻点推算速度 ≤ 150 m/s（识别时间/位置单位错
+  误）；海拔低于地形 50 m 以上视为基准/单位错误；`pos/alt_m/battery_wh/
+  attitude` 缺测（`null` 或缺失）逐点列出。
+- **匹配与计算**：轨迹点按最近测线归属（容差 = max(2×偏差阈值,
+  1.5×线距)，之外视为转场）；逐点计算横向偏差、返航余量（实际剩余电量
+  − 返航能耗 − 余量）；照片按实际 AGL 与姿态（yaw 为相机朝向，顺时针自
+  北）生成幅面，计算实际 GSD（对照该测段计划承诺的 `gsd_cm_max`）、曝
+  光间距/航向重叠（同一测线上相邻触发）、覆盖并集与禁飞侵入。
+- **响应**：`events[]` 按时刻排序（`cross_track_deviation` /
+  `exposure_gap` / `nfz_intrusion` / `return_margin_low`），
+  `first_event` 即首个偏离；`segments[]` 给出每测段
+  `flown/partial/not_flown` 与偏差统计；`uncovered_areas[]` 为未覆盖区
+  （面积/质心/最近测段）；`affected_photos[]` 列出受影响照片及原因
+  （`gsd_breach/tilt_exceeded/exposure_gap/low_forward_overlap/
+  nfz_intrusion/below_terrain`）；`refly_segments[]` 为建议重飞测带；
+  `comparison` 对照计划与实飞的覆盖率、航程、能耗（电量差）与风险。
+- **审计**：日志原文、逐点结果、GeoJSON 与 `rules_version` 一并写入
+  SQLite；`replay` 用当前代码重算并比对指标/事件/GeoJSON。
+
+### 补飞建议
+
+```json
+POST /api/v1/flights/{fid}/reflight
+{"locked_segment_ids": ["S001", "S002"], "overrides": {"heading_deg": 90}}
+```
+
+`locked_segment_ids` 缺省时自动锁定核验未标记的全部测段；锁定段冻结后
+对剩余区域重排（复用 replan 机制），结果存为子方案。锁定被标记重飞的
+测段会在 `warnings` 中提示。
+
 ## 模型与假设
 
 - **航高**：由目标 GSD 推出离地高度 `H = GSD·f·W_px/S_w`；每段取段内最
@@ -101,4 +167,5 @@ POST /api/v1/plans/{id}/replan
   在 `options` 覆盖）；含出库、转弯（π·r 近似，半径超过半线距时告警）
   与返航。每段核算"剩余电量 ≥ 返航能耗 + 返航余量"。
 - **重演**：请求、结果、GeoJSON 与 `ALGO_VERSION` 一并落库；replay 用
-  当前代码重算并比对指标，算法升级后可发现结果漂移。
+  当前代码重算并比对指标，算法升级后可发现结果漂移。实飞核验同理，以
+  `VERIFY_VERSION` 记录规则版本。

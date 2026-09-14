@@ -20,6 +20,15 @@ CREATE TABLE IF NOT EXISTS plans (
     result_json  TEXT NOT NULL,
     geojson_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS flights (
+    id            TEXT PRIMARY KEY,
+    plan_id       TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    rules_version TEXT NOT NULL,
+    request_json  TEXT NOT NULL,
+    result_json   TEXT NOT NULL,
+    geojson_json  TEXT NOT NULL
+);
 """
 
 
@@ -89,6 +98,59 @@ class Store:
                 "parent_id": r["parent_id"],
                 "created_at": r["created_at"],
                 "algo_version": r["algo_version"],
+                "metrics": result.get("metrics"),
+            })
+        return out
+
+    # -- as-flown verifications --------------------------------------------
+
+    def save_flight(self, plan_id, request, result, geojson, rules_version):
+        fid = uuid.uuid4().hex[:12]
+        with self._lock, self._connect() as con:
+            con.execute(
+                "INSERT INTO flights VALUES (?,?,?,?,?,?,?)",
+                (
+                    fid,
+                    plan_id,
+                    datetime.now(timezone.utc).isoformat(),
+                    rules_version,
+                    json.dumps(request, default=_json_default),
+                    json.dumps(result, default=_json_default),
+                    json.dumps(geojson, default=_json_default),
+                ),
+            )
+        return fid
+
+    def get_flight(self, fid):
+        with self._connect() as con:
+            row = con.execute("SELECT * FROM flights WHERE id = ?", (fid,)).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "plan_id": row["plan_id"],
+            "created_at": row["created_at"],
+            "rules_version": row["rules_version"],
+            "request": json.loads(row["request_json"]),
+            "result": json.loads(row["result_json"]),
+            "geojson": json.loads(row["geojson_json"]),
+        }
+
+    def list_flights(self, plan_id):
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT id, plan_id, created_at, rules_version, result_json "
+                "FROM flights WHERE plan_id = ? ORDER BY created_at",
+                (plan_id,),
+            ).fetchall()
+        out = []
+        for r in rows:
+            result = json.loads(r["result_json"])
+            out.append({
+                "id": r["id"],
+                "plan_id": r["plan_id"],
+                "created_at": r["created_at"],
+                "rules_version": r["rules_version"],
                 "metrics": result.get("metrics"),
             })
         return out

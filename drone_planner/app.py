@@ -5,6 +5,7 @@ import os
 from flask import Flask, jsonify, request
 
 from . import ALGO_VERSION
+from .asflown import VERIFY_VERSION, verify_flight
 from .errors import ValidationError
 from .planner import build_plan
 from .store import Store
@@ -42,7 +43,11 @@ def create_app(db_path=None):
 
     @app.get("/api/v1/health")
     def health():
-        return jsonify({"status": "ok", "algo_version": ALGO_VERSION})
+        return jsonify({
+            "status": "ok",
+            "algo_version": ALGO_VERSION,
+            "verify_version": VERIFY_VERSION,
+        })
 
     @app.post("/api/v1/plans")
     def create_plan():
@@ -135,5 +140,111 @@ def create_app(db_path=None):
             "delta": delta,
             "risk_delta": risk_delta,
         })
+
+    # -- as-flown verification ----------------------------------------------
+
+    def _load_flight(fid):
+        return store.get_flight(fid)
+
+    @app.post("/api/v1/plans/<pid>/flights")
+    def create_flight(pid):
+        row = _load(pid)
+        if row is None:
+            return jsonify({"error": f"plan {pid} not found"}), 404
+        body = _body()
+        result, geojson = verify_flight(row["request"], row["result"], body)
+        fid = store.save_flight(pid, body, result, geojson, VERIFY_VERSION)
+        return jsonify({"flight_id": fid, "plan_id": pid, **result}), 201
+
+    @app.get("/api/v1/plans/<pid>/flights")
+    def list_plan_flights(pid):
+        row = _load(pid)
+        if row is None:
+            return jsonify({"error": f"plan {pid} not found"}), 404
+        return jsonify({"plan_id": pid, "flights": store.list_flights(pid)})
+
+    @app.get("/api/v1/flights/<fid>")
+    def get_flight(fid):
+        frow = _load_flight(fid)
+        if frow is None:
+            return jsonify({"error": f"flight {fid} not found"}), 404
+        return jsonify({
+            "flight_id": frow["id"],
+            "plan_id": frow["plan_id"],
+            "created_at": frow["created_at"],
+            **frow["result"],
+        })
+
+    @app.get("/api/v1/flights/<fid>/geojson")
+    def get_flight_geojson(fid):
+        frow = _load_flight(fid)
+        if frow is None:
+            return jsonify({"error": f"flight {fid} not found"}), 404
+        return jsonify(frow["geojson"])
+
+    @app.post("/api/v1/flights/<fid>/replay")
+    def replay_flight(fid):
+        frow = _load_flight(fid)
+        if frow is None:
+            return jsonify({"error": f"flight {fid} not found"}), 404
+        row = _load(frow["plan_id"])
+        if row is None:
+            return jsonify({"error": f"plan {frow['plan_id']} not found"}), 404
+        result, geojson = verify_flight(row["request"], row["result"], frow["request"])
+        # canonical JSON comparison (tuples become lists after a store round-trip)
+        geojson_match = json.dumps(frow["geojson"], sort_keys=True) == json.dumps(
+            json.loads(json.dumps(geojson)), sort_keys=True
+        )
+        return jsonify({
+            "flight_id": fid,
+            "plan_id": frow["plan_id"],
+            "stored_rules_version": frow["rules_version"],
+            "current_rules_version": VERIFY_VERSION,
+            "metrics_match": frow["result"]["metrics"] == result["metrics"],
+            "events_match": frow["result"]["events"] == result["events"],
+            "geojson_match": geojson_match,
+            "stored_metrics": frow["result"]["metrics"],
+            "replayed_metrics": result["metrics"],
+        })
+
+    @app.post("/api/v1/flights/<fid>/reflight")
+    def reflight(fid):
+        frow = _load_flight(fid)
+        if frow is None:
+            return jsonify({"error": f"flight {fid} not found"}), 404
+        row = _load(frow["plan_id"])
+        if row is None:
+            return jsonify({"error": f"plan {frow['plan_id']} not found"}), 404
+        body = request.get_json(silent=True) or {}
+        segments = row["result"]["segments"]
+        known = {s["id"] for s in segments}
+        refly_ids = {s["id"] for s in frow["result"]["refly_segments"]}
+        locked = body.get("locked_segment_ids")
+        if locked is None:
+            # default: keep every segment the verification did not flag
+            locked = [s["id"] for s in segments if s["id"] not in refly_ids]
+        unknown = [s for s in locked if s not in known]
+        if unknown:
+            return jsonify({"errors": [f"unknown segment ids: {unknown}"]}), 400
+        warnings = []
+        flagged = [s for s in locked if s in refly_ids]
+        if flagged:
+            warnings.append(
+                f"locking segments the verification flagged for reflight: {flagged}"
+            )
+        merged = _deep_merge(row["request"], body.get("overrides") or {})
+        merged["frozen_segments"] = [s for s in segments if s["id"] in set(locked)]
+        result, geojson = build_plan(merged)
+        new_pid = store.save(row["id"], merged, result, geojson)
+        payload = {
+            "plan_id": new_pid,
+            "parent_id": row["id"],
+            "flight_id": fid,
+            "locked_segment_ids": locked,
+            "refly_segments": frow["result"]["refly_segments"],
+            **result,
+        }
+        payload["warnings"] = warnings + result.get("warnings", [])
+        return jsonify(payload), 201
 
     return app
